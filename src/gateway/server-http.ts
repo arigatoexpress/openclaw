@@ -31,6 +31,7 @@ import {
   handleControlUiHttpRequest,
   type ControlUiRootState,
 } from "./control-ui.js";
+import type { HealthSummary } from "../commands/health.js";
 import { applyHookMappings } from "./hooks-mapping.js";
 import {
   extractHookToken,
@@ -55,6 +56,7 @@ import { handleOpenAiHttpRequest } from "./openai-http.js";
 import { handleOpenResponsesHttpRequest } from "./openresponses-http.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 import { handleToolsInvokeHttpRequest } from "./tools-invoke-http.js";
+import { safeJsonStringify } from "../utils/safe-json.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
 type HookAuthFailure = { count: number; windowStartedAtMs: number };
@@ -441,6 +443,9 @@ export function createGatewayHttpServer(opts: {
   controlUiEnabled: boolean;
   controlUiBasePath: string;
   controlUiRoot?: ControlUiRootState;
+  getHealthCache: () => HealthSummary | null;
+  refreshHealthSnapshot: (opts?: { probe?: boolean }) => Promise<HealthSummary>;
+  getHealthVersion: () => number;
   openAiChatCompletionsEnabled: boolean;
   openResponsesEnabled: boolean;
   openResponsesConfig?: import("../config/types.gateway.js").GatewayHttpResponsesConfig;
@@ -457,6 +462,9 @@ export function createGatewayHttpServer(opts: {
     controlUiEnabled,
     controlUiBasePath,
     controlUiRoot,
+    getHealthCache,
+    refreshHealthSnapshot,
+    getHealthVersion,
     openAiChatCompletionsEnabled,
     openResponsesEnabled,
     openResponsesConfig,
@@ -483,6 +491,65 @@ export function createGatewayHttpServer(opts: {
       const configSnapshot = loadConfig();
       const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
       const requestPath = new URL(req.url ?? "/", "http://localhost").pathname;
+      if (requestPath === "/health") {
+        if (req.method !== "GET" && req.method !== "HEAD") {
+          res.statusCode = 405;
+          res.setHeader("Allow", "GET, HEAD");
+          res.end();
+          return;
+        }
+        let health: HealthSummary | null = getHealthCache();
+        if (!health) {
+          try {
+            health = await refreshHealthSnapshot({ probe: false });
+          } catch (err) {
+            console.warn("[gateway] /health refresh failed", err);
+            sendJson(res, 503, {
+              ok: false,
+              service: "openclaw-gateway",
+              error: "health_unavailable",
+              ts: Date.now(),
+            });
+            return;
+          }
+        }
+        if (!health || typeof health.ts !== "number") {
+          sendJson(res, 503, {
+            ok: false,
+            service: "openclaw-gateway",
+            error: "health_cache_empty",
+            ts: Date.now(),
+          });
+          return;
+        }
+        const body = {
+          ok: true,
+          service: "openclaw-gateway",
+          ts: Date.now(),
+          cached_at: health.ts,
+          stateVersion: { health: getHealthVersion() },
+          health,
+        };
+        const payload = safeJsonStringify(body);
+        if (!payload) {
+          console.warn("[gateway] /health serialization failed");
+          sendJson(res, 503, {
+            ok: false,
+            service: "openclaw-gateway",
+            error: "health_serialize_failed",
+            ts: Date.now(),
+          });
+          return;
+        }
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        if (req.method === "HEAD") {
+          res.end();
+          return;
+        }
+        res.end(payload);
+        return;
+      }
       if (await handleHooksRequest(req, res)) {
         return;
       }
@@ -587,7 +654,8 @@ export function createGatewayHttpServer(opts: {
       res.statusCode = 404;
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
       res.end("Not Found");
-    } catch {
+    } catch (err) {
+      console.warn("[gateway] http request failed", err);
       res.statusCode = 500;
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
       res.end("Internal Server Error");
